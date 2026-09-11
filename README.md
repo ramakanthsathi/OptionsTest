@@ -265,13 +265,17 @@ this machine is currently signed in to an employer tenant — the deploy script 
 - `journal_report.py` — expectancy, win rate, profit factor, drawdown, and stock-R vs option-R by
   strategy / catalyst grade / time of day / exit reason. Its output is embedded in the page.
 
-**Private page on GitHub Pages.** GitHub Pages cannot authenticate, so the page is public and the
-*data* is encrypted: the trader writes `today.json.enc` (AES-256-GCM, key from PBKDF2-SHA256 ×
-600 k over `JOURNAL_PAGE_PASSPHRASE`) to Blob; `site/journal.html` fetches it and decrypts in the
-browser with WebCrypto. Without the passphrase the blob is noise. This is encryption, not
-authentication — anyone can download the ciphertext — and `noindex` keeps it out of search.
-To install: set `DATA_URL` in `site/journal.html` to the value the deploy script prints, commit it
-into the svrtechservices.com repo at an unguessable path (e.g. `/j/<random>/index.html`). It
-refreshes every 60 s and remembers the passphrase for the tab session only.
-Stronger option if you ever want real login: Azure Static Web Apps with invited users on a
-`journal.svrtechservices.com` subdomain.
+**Private page.** svrtechservices.com turned out to be a Next.js static export on **Azure Static
+Web Apps** (repo `ramakanthsathi/SVRSite`), not GitHub Pages — so the page is protected two ways:
+1. `public/staticwebapp.config.json` routes `/journal/*` with `allowedRoles: ["journal"]`; anonymous
+   visitors are 302-redirected to Microsoft login. Grant the role with
+   `az staticwebapp users invite -n svr-website -g rg-svr-website --authentication-provider AAD
+   --user-details <email> --role journal --domain www.svrtechservices.com` and accept the link.
+2. The data itself (`today.json.enc`) is AES-256-GCM under a PBKDF2 key from `JOURNAL_PAGE_PASSPHRASE`,
+   decrypted in the browser. The blob is public-read but unreadable without the passphrase.
+Page: https://www.svrtechservices.com/journal/ (the registered custom domain is `www`).
+
+**Deployed 2026-09-11** to the personal subscription: `rg-aziz-trader` — storage `stazizj68f9c45530`
+(eastus), registry `acrazizt68f9c45530` (eastus), Container Apps environment `cae-aziz-trader` +
+job `job-paper-trader` in **eastus2** (eastus had no Container Apps capacity that day). First manual
+execution succeeded and published status from Azure. `deploy/job.sh start|list|stop` drives it via REST.

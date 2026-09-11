@@ -24,6 +24,7 @@ STORAGE="${STORAGE:-stazizj$SUFFIX}"              # globally unique, lowercase, 
 ACR="${ACR:-acrazizt$SUFFIX}"
 ENV_NAME="${ENV_NAME:-cae-aziz-trader}"
 JOB="${JOB:-job-paper-trader}"
+CAE_LOCATION="${CAE_LOCATION:-eastus2}"           # Container Apps env region (eastus had no capacity on 2026-09-11)
 SITE_ORIGIN="${SITE_ORIGIN:-https://svrtechservices.com}"
 # 13:25 UTC = 09:25 EDT (08:25 EST). The container sleeps until 09:40 ET itself (--wait-until), so DST
 # is handled in the script, not the cron. Container Apps cron is UTC only.
@@ -60,7 +61,12 @@ DATA_URL="https://${STORAGE}.blob.core.windows.net/journal/today.json.enc"
 
 echo "== registry + cloud build"
 az acr create -n "$ACR" -g "$RG" --sku Basic --admin-enabled true -o none
-az acr build -r "$ACR" -t paper-trader:latest "$(dirname "$0")/.." -o none
+if [[ "${SKIP_BUILD:-}" != "1" ]]; then
+PYTHONIOENCODING=utf-8 az acr build -r "$ACR" -t paper-trader:latest "$(dirname "$0")/.." --no-logs -o none
+RUN_ID=$(az acr task list-runs -r "$ACR" --top 1 --query "[0].runId" -o tsv)
+until [[ "$(az acr task show-run -r "$ACR" --run-id "$RUN_ID" --query status -o tsv)" =~ Succeeded|Failed|Canceled|Error ]]; do sleep 15; done
+[[ "$(az acr task show-run -r "$ACR" --run-id "$RUN_ID" --query status -o tsv)" == "Succeeded" ]] || { echo "image build failed (run $RUN_ID)"; exit 1; }
+fi
 ACR_SERVER=$(az acr show -n "$ACR" --query loginServer -o tsv)
 ACR_USER=$(az acr credential show -n "$ACR" --query username -o tsv)
 ACR_PASS=$(az acr credential show -n "$ACR" --query "passwords[0].value" -o tsv)
@@ -68,7 +74,7 @@ ACR_PASS=$(az acr credential show -n "$ACR" --query "passwords[0].value" -o tsv)
 echo "== container apps environment + job (ARM template; no CLI extension needed)"
 az provider register -n Microsoft.App --wait -o none
 az provider register -n Microsoft.OperationalInsights --wait -o none
-az deployment group create -g "$RG" -n "paper-trader-$(date +%Y%m%d%H%M%S)"    --template-file "$(dirname "$0")/job.json"    --parameters location="$LOCATION" envName="$ENV_NAME" jobName="$JOB" image="$ACR_SERVER/paper-trader:latest"                 registryServer="$ACR_SERVER" registryUsername="$ACR_USER" registryPassword="$ACR_PASS"                 cron="$CRON" traderArgs="${TRADER_ARGS:-}"                 uwKey="$UW_API_KEY" apcaKey="$APCA_API_KEY_ID" apcaSecret="$APCA_API_SECRET_KEY"                 sasUrl="$SAS_URL" pagePass="$JOURNAL_PAGE_PASSPHRASE"    --query "properties.provisioningState" -o tsv
+az deployment group create -g "$RG" -n "paper-trader-$(date +%Y%m%d%H%M%S)"    --template-file "$(dirname "$0")/job.json"    --parameters location="$CAE_LOCATION" envName="$ENV_NAME" jobName="$JOB" image="$ACR_SERVER/paper-trader:latest"                 registryServer="$ACR_SERVER" registryUsername="$ACR_USER" registryPassword="$ACR_PASS"                 cron="$CRON" traderArgs="${TRADER_ARGS:-}"                 uwKey="$UW_API_KEY" apcaKey="$APCA_API_KEY_ID" apcaSecret="$APCA_API_SECRET_KEY"                 sasUrl="$SAS_URL" pagePass="$JOURNAL_PAGE_PASSPHRASE"    --query "properties.provisioningState" -o tsv
 
 printf 'JOURNAL_BLOB_SAS_URL=%s
 DATA_URL=%s
