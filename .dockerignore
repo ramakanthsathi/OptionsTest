@@ -1,0 +1,9 @@
+signals/
+status/
+journal.csv
+paper_state.json
+ca_bundle.pem
+__pycache__/
+.claude/
+site/
+*.md

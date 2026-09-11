@@ -1,0 +1,10 @@
+# machine-specific / generated / private
+ca_bundle.pem
+signals/
+status/
+journal.csv
+paper_state.json
+__pycache__/
+*.pyc
+.claude/
+.env

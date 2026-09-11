@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Trading Journal</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262b35; --fg:#e6e8ec; --mut:#8b93a3; --up:#3ccf7a; --dn:#ef5f5f; --acc:#5b9dff; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f6f7f9; --panel:#fff; --line:#e3e6eb; --fg:#1b1f27; --mut:#68707f; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width:1100px; margin:0 auto; padding:20px 16px 60px; }
+  h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:14px; color:var(--mut); text-transform:uppercase; letter-spacing:.06em; margin:24px 0 8px; }
+  .sub { color:var(--mut); font-size:12px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:10px; }
+  .tile { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+  .tile .k { color:var(--mut); font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+  .tile .v { font-size:20px; font-weight:600; margin-top:2px; font-variant-numeric: tabular-nums; }
+  .up { color:var(--up); } .dn { color:var(--dn); }
+  table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; font-variant-numeric: tabular-nums; }
+  th, td { padding:7px 9px; border-bottom:1px solid var(--line); text-align:left; white-space:nowrap; }
+  th { color:var(--mut); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+  tr:last-child td { border-bottom:0; }
+  .scroll { overflow-x:auto; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; }
+  .events { font-family: ui-monospace, Consolas, monospace; font-size:12px; white-space:pre-wrap; max-height:260px; overflow:auto; }
+  .gate { max-width:420px; margin:80px auto; }
+  input[type=password] { width:100%; padding:10px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--fg); font-size:14px; }
+  button { margin-top:10px; padding:9px 14px; border-radius:6px; border:0; background:var(--acc); color:#fff; font-weight:600; cursor:pointer; }
+  .err { color:var(--dn); margin-top:8px; }
+  .badge { display:inline-block; padding:2px 7px; border-radius:999px; font-size:11px; background:var(--line); color:var(--fg); margin-left:6px; }
+  .foot { color:var(--mut); font-size:11px; margin-top:24px; }
+  a { color:var(--acc); }
+</style>
+</head>
+<body>
+<div class="wrap" id="app"></div>
+<script>
+// ------------------------------------------------------------------------------------------
+// CONFIG: the public-read blob written by paper_trader.py (publish.py). Set after deploy.
+const DATA_URL = "https://REPLACE_ME.blob.core.windows.net/journal/today.json.enc";
+const REFRESH_SEC = 60;
+// ------------------------------------------------------------------------------------------
+const $ = (h) => { const t = document.createElement("template"); t.innerHTML = h.trim(); return t.content.firstChild; };
+const app = document.getElementById("app");
+const money = (x) => (x == null || x === "" ? "—" : (x >= 0 ? "+" : "−") + "$" + Math.abs(x).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}));
+const cls = (x) => (x > 0 ? "up" : x < 0 ? "dn" : "");
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+async function deriveKey(pass, saltB64, iters) {
+  const enc = new TextEncoder();
+  const base = await crypto.subtle.importKey("raw", enc.encode(pass), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey({name: "PBKDF2", salt: b64(saltB64), iterations: iters, hash: "SHA-256"},
+    base, {name: "AES-GCM", length: 256}, false, ["decrypt"]);
+}
+const b64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+async function decrypt(envelope, pass) {
+  const key = await deriveKey(pass, envelope.salt, envelope.iters);
+  const pt = await crypto.subtle.decrypt({name: "AES-GCM", iv: b64(envelope.iv)}, key, b64(envelope.ct));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+
+function gate(msg) {
+  app.replaceChildren($(`<div class="gate panel">
+    <h1>Trading journal</h1><div class="sub">Encrypted. Enter the passphrase to view.</div>
+    <form id="f"><input type="password" id="p" autocomplete="current-password" placeholder="passphrase" autofocus>
+    <button>Open</button>${msg ? `<div class="err">${esc(msg)}</div>` : ""}</form></div>`));
+  document.getElementById("f").onsubmit = (e) => { e.preventDefault(); sessionStorage.setItem("jp", document.getElementById("p").value); load(); };
+}
+
+async function load() {
+  const pass = sessionStorage.getItem("jp");
+  if (!pass) return gate();
+  let env;
+  try {
+    const r = await fetch(DATA_URL + "?t=" + Date.now(), {cache: "no-store"});
+    if (!r.ok) throw new Error("fetch " + r.status);
+    env = await r.json();
+  } catch (e) { return gate("Could not fetch data: " + e.message); }
+  let d;
+  try { d = await decrypt(env, pass); } catch (e) { sessionStorage.removeItem("jp"); return gate("Wrong passphrase."); }
+  render(d);
+  setTimeout(load, REFRESH_SEC * 1000);
+}
+
+function statRow(name, v) {
+  if (!v || !v.trades) return "";
+  return `<tr><td>${esc(name)}</td><td>${v.trades}</td><td>${Math.round(v.win_rate * 100)}%</td>
+    <td class="${cls(v.pnl)}">${money(v.pnl)}</td><td>${v.profit_factor}</td><td>${v.avg_stock_r}</td><td>${v.avg_option_r}</td><td>${v.translation_cost_r}</td></tr>`;
+}
+function statTable(title, obj) {
+  if (!obj) return "";
+  const rows = Object.entries(obj).map(([k, v]) => statRow(k, v)).join("");
+  if (!rows) return "";
+  return `<h2>${esc(title)}</h2><div class="scroll"><table><thead><tr><th>bucket</th><th>n</th><th>win</th><th>P&amp;L</th><th>PF</th><th>stock R</th><th>option R</th><th>cost R</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function render(d) {
+  const pub = new Date(d.published_at);
+  const ageMin = Math.round((Date.now() - pub.getTime()) / 60000);
+  const o = d.open_position, s = d.stats, ov = s ? s.overall : null;
+  const trades = d.today_trades || [];
+  const can = d.can_open || [true, ""];
+  app.replaceChildren($(`<div>
+    <h1>Trading journal <span class="badge">${esc(d.mode)}</span> <span class="badge">${esc(d.date)}</span></h1>
+    <div class="sub">last update ${pub.toLocaleTimeString()} (${ageMin} min ago) · ${esc(d.last_scan?.note || "")}${d.last_scan?.time ? " at " + esc(d.last_scan.time) : ""}
+      · sizing account $${Number(d.account_for_sizing).toLocaleString()} @ ${d.risk_pct}% · window ${esc((d.windows || []).map(w => w.join("–")).join(", "))} · min catalyst ${esc(d.min_catalyst_grade)}</div>
+
+    <h2>Today</h2>
+    <div class="grid">
+      <div class="tile"><div class="k">Today P&amp;L</div><div class="v ${cls(d.today_pnl)}">${money(d.today_pnl)}</div></div>
+      <div class="tile"><div class="k">Week P&amp;L</div><div class="v ${cls(d.week_pnl)}">${money(d.week_pnl)}</div></div>
+      <div class="tile"><div class="k">Trades today</div><div class="v">${trades.length}</div></div>
+      <div class="tile"><div class="k">Can open</div><div class="v ${can[0] ? "up" : "dn"}">${can[0] ? "yes" : "no"}</div><div class="sub">${esc(can[1] || "")}</div></div>
+      <div class="tile"><div class="k">Open position</div><div class="v">${o ? esc(o.ticker) : "flat"}</div>
+        <div class="sub">${o ? `${esc(o.contract)} ×${o.contracts} @ ${o.option_entry} · stock ${o.stock_entry} → ${o.stock_target}, stop ${o.breakeven ? o.stock_entry + " (BE)" : o.stock_stop}${o.half_taken ? " · half off" : ""}` : ""}</div></div>
+    </div>
+
+    ${d.last_scan?.candidates?.length ? `<h2>Last scan candidates</h2><div class="panel events">${d.last_scan.candidates.map(esc).join("\n")}</div>` : ""}
+
+    <h2>Today's trades</h2>
+    <div class="scroll"><table><thead><tr><th>in</th><th>out</th><th>ticker</th><th>strategy</th><th>dir</th><th>contract</th><th>qty</th><th>opt in</th><th>opt out</th><th>stock in</th><th>stock out</th><th>stock R</th><th>opt R</th><th>P&amp;L</th><th>exit</th><th>grade</th></tr></thead>
+    <tbody>${trades.length ? trades.map(t => `<tr><td>${esc(t.entry_time)}</td><td>${esc(t.exit_time)}</td><td><b>${esc(t.ticker)}</b></td><td>${esc(t.strategy)}</td><td>${esc(t.direction)}</td><td>${esc(t.contract)}</td><td>${t.contracts}</td><td>${t.option_entry}</td><td>${t.option_exit}</td><td>${t.stock_entry}</td><td>${t.stock_exit}</td><td>${t.stock_r}</td><td>${t.option_r}</td><td class="${cls(t.pnl)}">${money(t.pnl)}</td><td>${esc(t.exit_reason)}</td><td>${esc(String(t.catalyst || "").slice(0, 1))}</td></tr>`).join("") : `<tr><td colspan="16" class="sub">no closed trades today</td></tr>`}</tbody></table></div>
+
+    ${ov ? `<h2>All time <span class="badge">${ov.trades} trades</span></h2>
+    <div class="grid">
+      <div class="tile"><div class="k">P&amp;L</div><div class="v ${cls(ov.pnl)}">${money(ov.pnl)}</div></div>
+      <div class="tile"><div class="k">Win rate</div><div class="v">${Math.round(ov.win_rate * 100)}%</div></div>
+      <div class="tile"><div class="k">Profit factor</div><div class="v">${ov.profit_factor}</div></div>
+      <div class="tile"><div class="k">Avg stock R</div><div class="v ${cls(ov.avg_stock_r)}">${ov.avg_stock_r}</div></div>
+      <div class="tile"><div class="k">Avg option R</div><div class="v ${cls(ov.avg_option_r)}">${ov.avg_option_r}</div></div>
+      <div class="tile"><div class="k">Translation cost</div><div class="v">${ov.translation_cost_r} R</div><div class="sub">stock R − option R per trade</div></div>
+      <div class="tile"><div class="k">Max drawdown</div><div class="v dn">${money(s.max_drawdown)}</div></div>
+      <div class="tile"><div class="k">Streak</div><div class="v ${cls(s.streak)}">${s.streak > 0 ? "+" : ""}${s.streak}</div></div>
+    </div>
+    ${statTable("By strategy", s.by_strategy)}${statTable("By catalyst grade", s.by_grade)}${statTable("By time of day", s.by_time)}${statTable("By exit reason", s.by_exit)}` : ""}
+
+    <h2>Events</h2><div class="panel events">${(d.events || []).map(esc).join("\n") || "—"}</div>
+    <div class="foot">Paper trading only. Rules from Andrew Aziz's <i>How to Day Trade for a Living</i>; options layer is not from the book. Not advice.
+      <a href="#" id="lock">lock</a></div>
+  </div>`));
+  document.getElementById("lock").onclick = (e) => { e.preventDefault(); sessionStorage.removeItem("jp"); gate(); };
+}
+load();
+</script>
+</body>
+</html>
