@@ -37,7 +37,7 @@ echo "Deploying to subscription: $SUB_NAME  (as $TENANT_USER)"
 if [[ "$SUB_NAME" =~ [Tt]egna || "$TENANT_USER" =~ tegna ]]; then
   echo "REFUSING: this looks like an employer subscription. Log in to your personal one."; exit 1
 fi
-read -r -p "Continue? [y/N] " ok; [[ "$ok" == "y" ]] || exit 1
+if [[ "${YES:-}" != "1" ]]; then read -r -p "Continue? [y/N] " ok; [[ "$ok" == "y" ]] || exit 1; fi
 
 echo "== resource group"; az group create -n "$RG" -l "$LOCATION" -o none
 
@@ -62,35 +62,19 @@ ACR_SERVER=$(az acr show -n "$ACR" --query loginServer -o tsv)
 ACR_USER=$(az acr credential show -n "$ACR" --query username -o tsv)
 ACR_PASS=$(az acr credential show -n "$ACR" --query "passwords[0].value" -o tsv)
 
-echo "== container apps environment"
-az extension add --name containerapp --upgrade -o none 2>/dev/null || true
+echo "== container apps environment + job (ARM template; no CLI extension needed)"
 az provider register -n Microsoft.App --wait -o none
 az provider register -n Microsoft.OperationalInsights --wait -o none
-az containerapp env create -n "$ENV_NAME" -g "$RG" -l "$LOCATION" -o none 2>/dev/null || true
-
-echo "== job"
-COMMON=(--resource-group "$RG" --image "$ACR_SERVER/paper-trader:latest"
-        --registry-server "$ACR_SERVER" --registry-username "$ACR_USER" --registry-password "$ACR_PASS"
-        --secrets "uw-key=$UW_API_KEY" "apca-key=$APCA_API_KEY_ID" "apca-secret=$APCA_API_SECRET_KEY"
-                  "sas-url=$SAS_URL" "page-pass=$JOURNAL_PAGE_PASSPHRASE"
-        --env-vars "UW_API_KEY=secretref:uw-key" "APCA_API_KEY_ID=secretref:apca-key" "APCA_API_SECRET_KEY=secretref:apca-secret"
-                   "JOURNAL_BLOB_SAS_URL=secretref:sas-url" "JOURNAL_PAGE_PASSPHRASE=secretref:page-pass"
-                   "TRADER_ARGS=${TRADER_ARGS:-}"
-        --cpu 0.5 --memory 1.0Gi)
-if az containerapp job show -n "$JOB" -g "$RG" -o none 2>/dev/null; then
-  az containerapp job update -n "$JOB" "${COMMON[@]}" -o none
-else
-  az containerapp job create -n "$JOB" --environment "$ENV_NAME" --trigger-type Schedule --cron-expression "$CRON" \
-     --replica-timeout 27000 --replica-retry-limit 0 --parallelism 1 --replica-completion-count 1 "${COMMON[@]}" -o none
-fi
+az deployment group create -g "$RG" -n "paper-trader-$(date +%Y%m%d%H%M%S)"    --template-file "$(dirname "$0")/job.json"    --parameters location="$LOCATION" envName="$ENV_NAME" jobName="$JOB" image="$ACR_SERVER/paper-trader:latest"                 registryServer="$ACR_SERVER" registryUsername="$ACR_USER" registryPassword="$ACR_PASS"                 cron="$CRON" traderArgs="${TRADER_ARGS:-}"                 uwKey="$UW_API_KEY" apcaKey="$APCA_API_KEY_ID" apcaSecret="$APCA_API_SECRET_KEY"                 sasUrl="$SAS_URL" pagePass="$JOURNAL_PAGE_PASSPHRASE"    --query "properties.provisioningState" -o tsv
 
 cat <<EOF
 
 DONE.
   Job:        $JOB in $RG  (cron '$CRON' UTC, one execution per weekday, exits after 15:45 ET)
-  Run now:    az containerapp job start -n $JOB -g $RG
-  Logs:       az containerapp job execution list -n $JOB -g $RG -o table
-              az containerapp logs show -n $JOB -g $RG --type console --follow   (during a run)
+  Run now:    bash deploy/job.sh start
+  Executions: bash deploy/job.sh list
+  Logs:       Azure portal -> Container Apps Jobs -> $JOB -> Execution history -> Console logs
+              (the 'az containerapp' extension cannot install on this machine's CLI; job.sh uses the REST API)
   Journal:    $SAS_URL   <-- SECRET (write access); keep it out of the site
   Page data:  $DATA_URL
               -> paste into site/journal.html as DATA_URL, commit journal.html to the svrtechservices repo

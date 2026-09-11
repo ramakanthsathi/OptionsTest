@@ -1,0 +1,80 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location":      { "type": "string" },
+    "envName":       { "type": "string" },
+    "jobName":       { "type": "string" },
+    "image":         { "type": "string" },
+    "registryServer":   { "type": "string" },
+    "registryUsername": { "type": "string" },
+    "registryPassword": { "type": "securestring" },
+    "cron":          { "type": "string", "defaultValue": "25 13 * * 1-5" },
+    "traderArgs":    { "type": "string", "defaultValue": "" },
+    "uwKey":         { "type": "securestring" },
+    "apcaKey":       { "type": "securestring" },
+    "apcaSecret":    { "type": "securestring" },
+    "sasUrl":        { "type": "securestring" },
+    "pagePass":      { "type": "securestring" }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2024-03-01",
+      "name": "[parameters('envName')]",
+      "location": "[parameters('location')]",
+      "properties": {}
+    },
+    {
+      "type": "Microsoft.App/jobs",
+      "apiVersion": "2024-03-01",
+      "name": "[parameters('jobName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [ "[resourceId('Microsoft.App/managedEnvironments', parameters('envName'))]" ],
+      "properties": {
+        "environmentId": "[resourceId('Microsoft.App/managedEnvironments', parameters('envName'))]",
+        "configuration": {
+          "triggerType": "Schedule",
+          "replicaTimeout": 27000,
+          "replicaRetryLimit": 0,
+          "scheduleTriggerConfig": {
+            "cronExpression": "[parameters('cron')]",
+            "parallelism": 1,
+            "replicaCompletionCount": 1
+          },
+          "registries": [
+            { "server": "[parameters('registryServer')]", "username": "[parameters('registryUsername')]", "passwordSecretRef": "acr-password" }
+          ],
+          "secrets": [
+            { "name": "acr-password", "value": "[parameters('registryPassword')]" },
+            { "name": "uw-key",       "value": "[parameters('uwKey')]" },
+            { "name": "apca-key",     "value": "[parameters('apcaKey')]" },
+            { "name": "apca-secret",  "value": "[parameters('apcaSecret')]" },
+            { "name": "sas-url",      "value": "[parameters('sasUrl')]" },
+            { "name": "page-pass",    "value": "[parameters('pagePass')]" }
+          ]
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "paper-trader",
+              "image": "[parameters('image')]",
+              "resources": { "cpu": 0.5, "memory": "1Gi" },
+              "env": [
+                { "name": "UW_API_KEY",              "secretRef": "uw-key" },
+                { "name": "APCA_API_KEY_ID",         "secretRef": "apca-key" },
+                { "name": "APCA_API_SECRET_KEY",     "secretRef": "apca-secret" },
+                { "name": "JOURNAL_BLOB_SAS_URL",    "secretRef": "sas-url" },
+                { "name": "JOURNAL_PAGE_PASSPHRASE", "secretRef": "page-pass" },
+                { "name": "TRADER_ARGS",             "value": "[parameters('traderArgs')]" }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "jobId": { "type": "string", "value": "[resourceId('Microsoft.App/jobs', parameters('jobName'))]" }
+  }
+}
