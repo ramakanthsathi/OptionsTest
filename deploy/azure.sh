@@ -17,8 +17,11 @@ set -euo pipefail
 SUB="${1:?usage: deploy/azure.sh <subscription name or id>}"
 LOCATION="${LOCATION:-eastus}"
 RG="${RG:-rg-aziz-trader}"
-STORAGE="${STORAGE:-stazizjournal$RANDOM}"        # must be globally unique, lowercase, <=24 chars
-ACR="${ACR:-acrazizt$RANDOM}"
+# names derived from the subscription id so re-running the script updates the same resources
+az account set --subscription "$SUB"
+SUFFIX=$(az account show --query id -o tsv | tr -d '-' | cut -c1-10)
+STORAGE="${STORAGE:-stazizj$SUFFIX}"              # globally unique, lowercase, <=24 chars
+ACR="${ACR:-acrazizt$SUFFIX}"
 ENV_NAME="${ENV_NAME:-cae-aziz-trader}"
 JOB="${JOB:-job-paper-trader}"
 SITE_ORIGIN="${SITE_ORIGIN:-https://svrtechservices.com}"
@@ -67,6 +70,9 @@ az provider register -n Microsoft.App --wait -o none
 az provider register -n Microsoft.OperationalInsights --wait -o none
 az deployment group create -g "$RG" -n "paper-trader-$(date +%Y%m%d%H%M%S)"    --template-file "$(dirname "$0")/job.json"    --parameters location="$LOCATION" envName="$ENV_NAME" jobName="$JOB" image="$ACR_SERVER/paper-trader:latest"                 registryServer="$ACR_SERVER" registryUsername="$ACR_USER" registryPassword="$ACR_PASS"                 cron="$CRON" traderArgs="${TRADER_ARGS:-}"                 uwKey="$UW_API_KEY" apcaKey="$APCA_API_KEY_ID" apcaSecret="$APCA_API_SECRET_KEY"                 sasUrl="$SAS_URL" pagePass="$JOURNAL_PAGE_PASSPHRASE"    --query "properties.provisioningState" -o tsv
 
+printf 'JOURNAL_BLOB_SAS_URL=%s
+DATA_URL=%s
+' "$SAS_URL" "$DATA_URL" > "$(dirname "$0")/secrets.local.env"
 cat <<EOF
 
 DONE.
@@ -75,7 +81,7 @@ DONE.
   Executions: bash deploy/job.sh list
   Logs:       Azure portal -> Container Apps Jobs -> $JOB -> Execution history -> Console logs
               (the 'az containerapp' extension cannot install on this machine's CLI; job.sh uses the REST API)
-  Journal:    $SAS_URL   <-- SECRET (write access); keep it out of the site
+  Journal:    write-access SAS URL saved to deploy/secrets.local.env (git-ignored) -- keep it out of the site
   Page data:  $DATA_URL
               -> paste into site/journal.html as DATA_URL, commit journal.html to the svrtechservices repo
 EOF
