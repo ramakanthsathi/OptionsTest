@@ -125,6 +125,7 @@ class Config:
 
     # --- universe ---
     universe_size: int = 40            # cap on screener names (each costs ~4 API calls)
+    peer_cluster_min: int = 3          # Ch. 4: "a few stocks in one sector" on the scanner = sector move, not in play
     include_etfs: bool = False
     include_mid_day: bool = True       # author: Mid-day is "the most dangerous time"
 
@@ -1231,13 +1232,44 @@ def to_jsonable(o):
 # ===========================================================================
 # MAIN
 # ===========================================================================
+def apply_peer_cluster_rule(contexts: list[StockContext], cfg: Config) -> None:
+    """Book, Ch. 4: "If I have a few stocks in one sector [on the scanner], there is a good chance
+    that these stocks are not in play. They have high relative volume because their sector is under
+    heavy trading by institutional traders."  When >= peer_cluster_min names in the same sector are
+    moving >= min_gap_pct the same way today, each of them is a sector move (grade F, not in play)
+    unless it has an A-grade catalyst of its own (earnings / guidance / FDA / M&A)."""
+    by_sector: dict[tuple[str, int], list[StockContext]] = {}
+    for c in contexts:
+        if not c.sector or not np.isfinite(c.prev_close) or c.prev_close <= 0:
+            continue
+        chg = (c.price / c.prev_close - 1.0) * 100.0
+        if abs(chg) >= cfg.min_gap_pct:
+            by_sector.setdefault((c.sector, 1 if chg > 0 else -1), []).append(c)
+    for (sector, sign), members in by_sector.items():
+        if len(members) < cfg.peer_cluster_min:
+            continue
+        names = " ".join(m.ticker for m in members)
+        for c in members:
+            if c.catalyst_grade == "A":
+                c.warnings.append(f"sector cluster ({len(members)} {sector} names {'up' if sign > 0 else 'down'} together: {names}) "
+                                  f"but A-grade catalyst of its own -> kept")
+                continue
+            c.catalyst_grade = "F"
+            c.catalyst_kind = "sector-cluster"
+            c.catalyst = f"F [sector-cluster] {len(members)} {sector} names {'up' if sign > 0 else 'down'} together today ({names}); " + c.catalyst
+            c.in_play = False
+            c.warnings.append(f"Rule 4 / Ch. 4: {len(members)} {sector} stocks gapping the same way -> sector move, not a Stock in Play")
+
+
 def scan_once(cfg: Config, source, tickers: list[str], now: datetime, log, replay: Optional[str] = None,
               replay_time: Optional[str] = None, include_not_in_play: bool = False, with_options: bool = True):
     """Evaluate every ticker on its latest bar. Returns (results, rejected, contexts); results are
-    unsorted dicts {ctx, signal, option, score}. Used by main() and by paper_trader.py."""
+    unsorted dicts {ctx, signal, option, score}. Used by main() and by paper_trader.py.
+    Two passes: assess every stock first (so the sector-cluster rule can see the whole list), then
+    run the setup detectors and the options layer."""
     a = argparse.Namespace(replay=replay, replay_time=replay_time, include_not_in_play=include_not_in_play,
                            no_options=not with_options)
-    results, rejected, contexts = [], [], []
+    results, rejected, contexts, assessed_all = [], [], [], []
     for i, t in enumerate(tickers, 1):
         try:
             daily = source.daily_bars(t)
@@ -1251,11 +1283,17 @@ def scan_once(cfg: Config, source, tickers: list[str], now: datetime, log, repla
             log(f"  [{i}/{len(tickers)}] {t}: assessment error: {e}"); continue
         if not assessed:
             log(f"  [{i}/{len(tickers)}] {t}: no session data"); continue
-        ctx, reg, levels, atr_val = assessed
-        contexts.append(ctx)
+        assessed_all.append((i, t, assessed))
+        contexts.append(assessed[0])
+        if source.name == "yahoo":
+            time.sleep(0.2)  # be polite to Yahoo
+
+    apply_peer_cluster_rule(contexts, cfg)
+
+    for i, t, (ctx, reg, levels, atr_val) in assessed_all:
         det = SetupDetector(t, reg, levels, atr_val, ctx.prev_close, cfg, rejected)
         sigs = merge_confluent(det.run_all())
-        tag = "IN PLAY" if ctx.in_play else "not in play"
+        tag = "IN PLAY" if ctx.in_play else ("sector move" if ctx.catalyst_kind == "sector-cluster" else "not in play")
         log(f"  [{i}/{len(tickers)}] {t:6s} {ctx.price:8.2f}  gap {ctx.gap_pct:+6.1f}%  relvol {ctx.rel_vol:5.1f}x  "
             f"ATR {ctx.atr:5.2f}  {tag:12s} setups: {', '.join(s.strategy for s in sigs) or '-'}")
         if not sigs:
@@ -1270,8 +1308,6 @@ def scan_once(cfg: Config, source, tickers: list[str], now: datetime, log, repla
             if not a.no_options and not a.replay:
                 opt = pick_option(s, ctx.price, cfg, now, log, source)
             results.append({"ctx": ctx, "signal": s, "option": opt, "score": score(ctx, s, opt)})
-        if source.name == "yahoo":
-            time.sleep(0.2)  # be polite to Yahoo
 
     return results, rejected, contexts
 
