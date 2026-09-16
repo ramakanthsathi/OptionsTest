@@ -69,9 +69,15 @@ def summarize(rows: list[dict]) -> dict:
             streak += s
         else:
             break
+    # translation cost the honest way: realised R of the option legs vs realised R of the stock legs
+    st = [r["option_r"] for r in rows if r.get("instrument") == "stock"]
+    op = [r["option_r"] for r in rows if r.get("instrument") == "option"]
     return dict(
         overall=_bucket_stats(rows), by_strategy=by("strategy"), by_grade=by("catalyst_grade"),
         by_time=by("time_bucket"), by_exit=by("exit_reason"), by_direction=by("direction"),
+        by_instrument=by("instrument"),
+        stock_leg_avg_r=round(sum(st) / len(st), 2) if st else None,
+        option_leg_avg_r=round(sum(op) / len(op), 2) if op else None,
         equity_curve=cur, max_drawdown=round(dd, 2), streak=streak,
         exit_reasons={k: len(v) for k, v in _group(rows, "exit_reason").items()},
     )
@@ -98,8 +104,10 @@ def print_report(s: dict, n_rows: int):
           f"profit factor {o['profit_factor']}   max DD {s['max_drawdown']:+,.2f}   streak {s['streak']:+d}")
     print(f"avg stock-R {o['avg_stock_r']:+.2f}   avg option-R {o['avg_option_r']:+.2f}   "
           f"translation cost {o['translation_cost_r']:+.2f} R/trade  <-- the number that decides if options make sense")
-    for title, key in (("BY STRATEGY", "by_strategy"), ("BY CATALYST GRADE", "by_grade"), ("BY TIME OF DAY", "by_time"),
-                       ("BY EXIT REASON", "by_exit")):
+    if s.get("stock_leg_avg_r") is not None or s.get("option_leg_avg_r") is not None:
+        print(f"stock legs avg realised R {s.get('stock_leg_avg_r')}   option legs avg realised R {s.get('option_leg_avg_r')}")
+    for title, key in (("BY INSTRUMENT", "by_instrument"), ("BY STRATEGY", "by_strategy"), ("BY CATALYST GRADE", "by_grade"),
+                       ("BY TIME OF DAY", "by_time"), ("BY EXIT REASON", "by_exit")):
         print(f"\n{title}")
         print(f"  {'bucket':32s} {'n':>3s} {'win%':>5s} {'pnl':>9s} {'PF':>5s} {'stkR':>6s} {'optR':>6s}")
         for k, v in s[key].items():

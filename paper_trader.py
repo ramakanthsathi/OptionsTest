@@ -69,7 +69,7 @@ import journal_report  # noqa: E402
 
 JOURNAL = os.path.join(_HERE, "journal.csv")
 STATE = os.path.join(_HERE, "paper_state.json")
-JOURNAL_FIELDS = ["date", "ticker", "strategy", "direction", "contract", "contracts", "entry_time", "exit_time",
+JOURNAL_FIELDS = ["date", "ticker", "strategy", "direction", "instrument", "contract", "contracts", "entry_time", "exit_time",
                   "stock_entry", "stock_stop", "stock_target", "stock_exit", "option_entry", "option_exit",
                   "exit_reason", "stock_r", "option_r", "pnl", "in_play", "catalyst", "time_bucket", "score"]
 
@@ -180,26 +180,33 @@ class AlpacaPaper:
 # ===========================================================================
 @dataclass
 class OpenTrade:
+    """One trade = the book's stock plan, expressed in up to two legs that share the same exits:
+    a STOCK leg (shares, long or short -- what the book actually trades) and an OPTION leg (a bought
+    call/put, only when a liquid contract clears 2:1). Either leg may be absent (qty 0)."""
     ticker: str
     strategy: str
     direction: str            # LONG / SHORT (the stock view; the option is always bought)
-    contract: str
-    contracts: int            # currently held
+    contract: str             # OCC symbol of the option leg, "" if none
+    contracts: int            # option contracts currently held
     contracts_initial: int
     entry_time: str
-    stock_entry: float
+    stock_entry: float        # plan levels (from the scanner)
     stock_stop: float
     stock_target: float
-    option_entry: float
+    option_entry: float       # option fill
     in_play: bool
     catalyst: str
     time_bucket: str
     score: float
     option_planned_risk: float = 0.0   # per-contract planned loss (premium points) if the stock stop is honoured
     half_taken: bool = False
-    half_exit_price: float = 0.0
+    half_exit_price: float = 0.0       # option half-exit fill
     breakeven: bool = False
     best_stock: float = 0.0   # best price seen in our favour
+    stock_qty: int = 0        # stock leg: shares currently held (positive for both long and short)
+    stock_qty_initial: int = 0
+    stock_fill: float = 0.0   # stock leg fill price
+    stock_half_exit: float = 0.0
 
 
 class RiskBook:
@@ -221,9 +228,13 @@ class RiskBook:
     def week_pnl(self, today: date) -> float:
         return self._pnl(today - timedelta(days=today.weekday()))
 
+    @staticmethod
+    def _key(r: dict) -> tuple:
+        return (r.get("date"), r.get("ticker"), r.get("entry_time"))   # a stock leg + option leg = one trade
+
     def day_trades_5d(self, today: date) -> int:
         cutoff = (pd.Timestamp(today) - pd.tseries.offsets.BDay(5)).date().isoformat()
-        return sum(1 for r in self.rows if r["date"] > cutoff)
+        return len({self._key(r) for r in self.rows if r["date"] > cutoff})
 
     def traded_today(self, today: date) -> set[str]:
         return {r["ticker"] for r in self.rows if r["date"] == today.isoformat()}
@@ -234,7 +245,7 @@ class RiskBook:
             return False, f"daily loss limit hit ({self.today_pnl(today):+.0f})"
         if self.week_pnl(today) <= -self.args.weekly_loss_pct / 100 * acct:
             return False, f"weekly loss limit hit ({self.week_pnl(today):+.0f})"
-        n_today = sum(1 for r in self.rows if r["date"] == today.isoformat())
+        n_today = len({self._key(r) for r in self.rows if r["date"] == today.isoformat()})
         if self.args.max_trades_per_day and n_today >= self.args.max_trades_per_day:
             return False, f"{n_today} trades already today (--max-trades-per-day {self.args.max_trades_per_day}; book: 2-3 a day)"
         if self.args.max_day_trades_5d and self.day_trades_5d(today) >= self.args.max_day_trades_5d:
@@ -306,6 +317,7 @@ class PaperTrader:
             can_open=self.risk.can_open(self.now().date()),
             last_scan=self.last_scan_info, events=self.events[-30:], stats=stats,
             windows=self.a.windows, strategies=sorted(self.allowed), min_catalyst_grade=self.a.min_catalyst_grade,
+            instrument=self.a.instrument,
         )
         try:
             self.status.publish(doc)
@@ -317,9 +329,15 @@ class PaperTrader:
         """Make the state file agree with what Alpaca actually holds before doing anything else."""
         if not self.broker:
             return
-        held = {p["symbol"]: p for p in self.broker.positions()
-                if p.get("asset_class") == "us_option" or len(p.get("symbol", "")) > 12}
-        if self.open and self.open.contract not in held:
+        held = {p["symbol"]: p for p in self.broker.positions()}
+        if self.open and self.open.stock_qty and self.open.ticker not in held:
+            self.note(f"reconcile: state had {self.open.stock_qty} sh {self.open.ticker} but Alpaca holds none -> dropping stock leg")
+            self.open.stock_qty = 0
+            save_state(self.open)
+        if self.open and not self.open.stock_qty and not self.open.contracts:
+            self.note("reconcile: trade has no legs left -> clearing state")
+            self.open = None; save_state(None)
+        if self.open and self.open.contracts and self.open.contract not in held:
             px = self.broker.last_fill(self.open.contract, "sell") or self.open.option_entry
             self.note(f"reconcile: state had {self.open.contract} but Alpaca holds none -> journaling as closed externally @ {px:.2f}")
             t = self.open
@@ -334,18 +352,22 @@ class PaperTrader:
             self.open = None
             save_state(None)
         for sym, p in held.items():
+            qty = int(abs(float(p.get("qty") or 0)))
             if self.open and self.open.contract == sym:
-                qty = int(float(p.get("qty") or 0))
                 if qty != self.open.contracts:
                     self.note(f"reconcile: Alpaca holds {qty} x {sym}, state said {self.open.contracts} -> adopting {qty}")
-                    self.open.contracts = qty
-                    save_state(self.open)
+                    self.open.contracts = qty; save_state(self.open)
                 continue
-            # an option position we have no plan for: the bot cannot manage it -> close it
-            qty = int(float(p.get("qty") or 0))
-            self.note(f"reconcile: orphan position {qty} x {sym} with no plan -> closing at market")
+            if self.open and self.open.ticker == sym and self.open.stock_qty:
+                if qty != self.open.stock_qty:
+                    self.note(f"reconcile: Alpaca holds {qty} sh {sym}, state said {self.open.stock_qty} -> adopting {qty}")
+                    self.open.stock_qty = qty; save_state(self.open)
+                continue
+            # a position we have no plan for: the bot cannot manage it -> close it
+            side = "sell" if float(p.get("qty") or 0) > 0 else "buy"
+            self.note(f"reconcile: orphan position {qty} x {sym} with no plan -> closing at market ({side})")
             try:
-                o = self.broker.submit_market(sym, qty, "sell")
+                o = self.broker.submit_market(sym, qty, side)
                 self.broker.wait_fill(o["id"], 60)
             except RuntimeError as e:
                 self.note(f"   could not close orphan: {e}")
@@ -384,10 +406,12 @@ class PaperTrader:
         for r in results:
             sig, ctx, opt = r["signal"], r["ctx"], r["option"]
             base = sig.strategy.split("+")
-            if not opt or not opt.actionable:
-                continue
             if not ctx.in_play:
                 continue
+            opt_ok = bool(opt and opt.actionable and opt.spread_pct <= self.cfg.max_spread_pct)
+            if self.a.instrument == "option" and not opt_ok:
+                continue
+            r["opt_ok"] = opt_ok
             if not any(b in self.allowed for b in base):
                 continue
             if len(dirs[sig.ticker]) > 1:
@@ -395,8 +419,6 @@ class PaperTrader:
             if sig.ticker in traded:
                 continue
             if "ABCDF".index(ctx.catalyst_grade) > "ABCDF".index(self.a.min_catalyst_grade):
-                continue
-            if opt.spread_pct > self.cfg.max_spread_pct:
                 continue
             out.append(r)
         out.sort(key=lambda r: -r["score"])
@@ -417,78 +439,131 @@ class PaperTrader:
         return out
 
     def enter(self, r: dict, now: datetime):
-        sig: StockSignal = r["signal"]; opt: OptionPlan = r["option"]; ctx = r["ctx"]
-        qty = max(1, min(opt.contracts, self.a.max_contracts))
-        self.log(f"ENTRY {alert_line(sig, opt)}")
-        if self.a.dry_run:
-            fill_qty, fill_px = qty, opt.ask
-            self.log(f"   dry-run: would buy {qty} x {opt.contract} @ {opt.ask:.2f}")
-        else:
-            o = self.broker.submit_limit(opt.contract, qty, "buy", opt.ask)
-            fill_qty, fill_px = self.broker.wait_fill(o["id"], self.a.fill_wait)
-            if fill_qty == 0:
-                self.log("   not filled within the wait -> skipped (book: do not chase)")
-                return
-            self.log(f"   filled {fill_qty} @ {fill_px:.2f}")
+        sig: StockSignal = r["signal"]; opt = r["option"]; ctx = r["ctx"]
+        long = sig.direction == "LONG"
+        want_stock = self.a.instrument in ("stock", "both")
+        want_opt = self.a.instrument in ("option", "both") and r.get("opt_ok")
+        risk_budget = self.cfg.account_size * self.cfg.risk_pct / 100.0
+        # --- stock leg sizing: book's three steps; notional capped at max_notional_pct of the account
+        s_qty = 0
+        if want_stock and sig.risk > 0:
+            s_qty = int(risk_budget // sig.risk)
+            s_qty = min(s_qty, int(self.cfg.account_size * self.a.max_notional_pct / 100.0 // max(sig.entry, 0.01)))
+        # --- option leg sizing (already computed by the scanner)
+        o_qty = max(1, min(opt.contracts, self.a.max_contracts)) if want_opt else 0
+        if s_qty < 1 and o_qty < 1:
+            self.log(f"   {sig.ticker}: no leg fits the risk budget (stock risk {sig.risk:.2f}/sh)"); return
+        legs = (f"{s_qty} sh" if s_qty else "") + (" + " if s_qty and o_qty else "") + (f"{o_qty} x {opt.contract}" if o_qty else "")
+        self.log(f"ENTRY {sig.ticker} {sig.direction} {sig.strategy} | stock {sig.entry:.2f} -> {sig.target:.2f}, stop {sig.stop:.2f} | {legs}")
+
+        s_fill = s_filled = 0.0
+        if s_qty:
+            side = "buy" if long else "sell"
+            lim = round(sig.entry * (1.001 if long else 0.999), 2)     # marketable limit, 0.1% slippage allowance
+            if self.a.dry_run:
+                s_filled, s_fill = s_qty, lim
+                self.log(f"   dry-run: would {side} {s_qty} sh {sig.ticker} @ {lim:.2f}")
+            else:
+                try:
+                    o = self.broker.submit_limit(sig.ticker, s_qty, side, lim)
+                    s_filled, s_fill = self.broker.wait_fill(o["id"], self.a.fill_wait)
+                except RuntimeError as e:                                  # e.g. not shortable
+                    self.log(f"   stock leg rejected: {e}"); s_filled = 0
+                self.log(f"   stock leg: {'filled' if s_filled else 'NOT filled'} {s_filled} @ {s_fill:.2f}")
+        o_fill = o_filled = 0.0
+        if o_qty:
+            if self.a.dry_run:
+                o_filled, o_fill = o_qty, opt.ask
+                self.log(f"   dry-run: would buy {o_qty} x {opt.contract} @ {opt.ask:.2f}")
+            else:
+                o = self.broker.submit_limit(opt.contract, o_qty, "buy", opt.ask)
+                o_filled, o_fill = self.broker.wait_fill(o["id"], self.a.fill_wait)
+                self.log(f"   option leg: {'filled' if o_filled else 'NOT filled'} {o_filled} @ {o_fill:.2f}")
+        if not s_filled and not o_filled:
+            self.log("   nothing filled within the wait -> skipped (book: do not chase)"); return
         self.open = OpenTrade(
-            ticker=sig.ticker, strategy=sig.strategy, direction=sig.direction, contract=opt.contract,
-            contracts=fill_qty, contracts_initial=fill_qty, entry_time=now.isoformat(),
-            stock_entry=sig.entry, stock_stop=sig.stop, stock_target=sig.target, option_entry=fill_px,
-            in_play=ctx.in_play, catalyst=ctx.catalyst, time_bucket=sig.time_bucket, score=r["score"],
-            option_planned_risk=opt.risk_per_contract / 100.0, best_stock=sig.entry)
+            ticker=sig.ticker, strategy=sig.strategy, direction=sig.direction,
+            contract=opt.contract if o_filled else "", contracts=int(o_filled), contracts_initial=int(o_filled),
+            entry_time=now.isoformat(), stock_entry=sig.entry, stock_stop=sig.stop, stock_target=sig.target,
+            option_entry=o_fill, in_play=ctx.in_play, catalyst=ctx.catalyst, time_bucket=sig.time_bucket, score=r["score"],
+            option_planned_risk=(opt.risk_per_contract / 100.0) if o_filled else 0.0, best_stock=sig.entry,
+            stock_qty=int(s_filled), stock_qty_initial=int(s_filled), stock_fill=s_fill)
         save_state(self.open)
-        self.events.append(f"{now:%H:%M:%S} ENTRY {alert_line(sig, opt)} filled @ {fill_px:.2f}")
+        self.events.append(f"{now:%H:%M:%S} ENTRY {sig.ticker} {sig.direction} {sig.strategy}: "
+                           + (f"{int(s_filled)} sh @ {s_fill:.2f} " if s_filled else "") + (f"{int(o_filled)} x {opt.contract} @ {o_fill:.2f}" if o_filled else ""))
         self.persist(); self.publish_status()
 
     # ---- exit -------------------------------------------------------------------
-    def sell(self, qty: int, reason: str, stock_px: float, now: datetime, mark_hint: float) -> float:
-        t = self.open
+    def _close_leg(self, symbol: str, qty: int, closing_side: str, ref_px: float, reason: str, is_option: bool) -> float:
+        """Close qty of a leg: marketable limit first, market for any remainder. Returns avg fill."""
         if self.a.dry_run:
-            px = mark_hint
-            self.log(f"   dry-run: would sell {qty} x {t.contract} ~{px:.2f} ({reason})")
-        else:
-            p = self.broker.position(t.contract)
-            bid_guess = float(p["current_price"]) if p and p.get("current_price") else mark_hint
-            o = self.broker.submit_limit(t.contract, qty, "sell", max(0.01, round(bid_guess * 0.98, 2)))
-            fq, px = self.broker.wait_fill(o["id"], 45)
-            if fq < qty:                                  # must get out: market for the remainder
-                o2 = self.broker.submit_market(t.contract, qty - fq, "sell")
-                fq2, px2 = self.broker.wait_fill(o2["id"], 30)
-                px = (px * fq + px2 * fq2) / max(fq + fq2, 1)
-            self.log(f"   sold {qty} @ {px:.2f} ({reason})")
+            self.log(f"   dry-run: would {closing_side} {qty} x {symbol} ~{ref_px:.2f} ({reason})")
+            return ref_px
+        tick = 0.98 if closing_side == "sell" else 1.02                    # give 2% to get out
+        if not is_option:
+            tick = 0.998 if closing_side == "sell" else 1.002
+        o = self.broker.submit_limit(symbol, qty, closing_side, max(0.01, round(ref_px * tick, 2)))
+        fq, px = self.broker.wait_fill(o["id"], 45)
+        if fq < qty:
+            o2 = self.broker.submit_market(symbol, qty - fq, closing_side)
+            fq2, px2 = self.broker.wait_fill(o2["id"], 30)
+            px = (px * fq + px2 * fq2) / max(fq + fq2, 1)
+        self.log(f"   {closing_side} {qty} x {symbol} @ {px:.2f} ({reason})")
         return px
 
-    def close_and_journal(self, qty: int, reason: str, stock_px: float, now: datetime, mark_hint: float):
+    def exit_trade(self, fraction: float, reason: str, stock_px: float, now: datetime, mark_hint: float):
+        """fraction 0.5 = book's 'sell half, stop to break-even'; 1.0 = flat. Applies to both legs."""
         t = self.open
-        px = self.sell(qty, reason, stock_px, now, mark_hint)
-        t.contracts -= qty
-        if t.contracts > 0:
-            t.half_taken, t.half_exit_price, t.breakeven = True, px, True
+        long = t.direction == "LONG"
+        s_q = t.stock_qty if fraction >= 1.0 else t.stock_qty // 2
+        o_q = t.contracts if fraction >= 1.0 else t.contracts // 2
+        if fraction < 1.0 and s_q < 1 and o_q < 1:          # can't halve a 1-unit position: take it all
+            s_q, o_q = t.stock_qty, t.contracts
+        s_px = self._close_leg(t.ticker, s_q, "sell" if long else "buy", stock_px, reason, False) if s_q else 0.0
+        o_px = self._close_leg(t.contract, o_q, "sell", mark_hint, reason, True) if o_q else 0.0
+        t.stock_qty -= s_q; t.contracts -= o_q
+        if t.stock_qty > 0 or t.contracts > 0:
+            t.half_taken, t.breakeven = True, True
+            if s_q: t.stock_half_exit = s_px
+            if o_q: t.half_exit_price = o_px
             save_state(t)
             self.log(f"   half off, stop moved to break-even {t.stock_entry:.2f}")
-            self.events.append(f"{now:%H:%M:%S} {t.ticker} half off @ {px:.2f}, stop -> break-even")
+            self.events.append(f"{now:%H:%M:%S} {t.ticker} half off, stop -> break-even")
             self.persist(); self.publish_status()
             return
-        # blended option exit across the half and the runner
-        n_half = t.contracts_initial - qty
-        opt_exit = (t.half_exit_price * n_half + px * qty) / t.contracts_initial if n_half else px
+        # ---- fully flat: one journal row per leg
+        sign = 1 if long else -1
         stock_risk = abs(t.stock_entry - t.stock_stop)
-        stock_move = (stock_px - t.stock_entry) * (1 if t.direction == "LONG" else -1)
-        pnl = (opt_exit - t.option_entry) * 100 * t.contracts_initial
-        opt_risk = t.option_planned_risk if t.option_planned_risk > 0 else max(t.option_entry * 0.4, 0.01)
-        row = dict(date=now.date().isoformat(), ticker=t.ticker, strategy=t.strategy, direction=t.direction,
-                   contract=t.contract, contracts=t.contracts_initial, entry_time=t.entry_time[11:16], exit_time=now.strftime("%H:%M"),
-                   stock_entry=t.stock_entry, stock_stop=t.stock_stop, stock_target=t.stock_target, stock_exit=round(stock_px, 2),
-                   option_entry=t.option_entry, option_exit=round(opt_exit, 2), exit_reason=reason,
-                   stock_r=round(stock_move / stock_risk, 2) if stock_risk else "",
-                   option_r=round((opt_exit - t.option_entry) / opt_risk, 2),   # option P&L in units of the planned per-contract risk
-                   pnl=round(pnl, 2), in_play=t.in_play, catalyst=t.catalyst, time_bucket=t.time_bucket, score=t.score)
-        self.risk.journal(row)
-        self.log(f"CLOSED {t.ticker} {reason}: stock R {row['stock_r']}  option P&L {pnl:+.0f}  "
+        stock_move = (stock_px - t.stock_entry) * sign
+        base = dict(date=now.date().isoformat(), ticker=t.ticker, strategy=t.strategy, direction=t.direction,
+                    entry_time=t.entry_time[11:16], exit_time=now.strftime("%H:%M"),
+                    stock_entry=t.stock_entry, stock_stop=t.stock_stop, stock_target=t.stock_target, stock_exit=round(stock_px, 2),
+                    exit_reason=reason, stock_r=round(stock_move / stock_risk, 2) if stock_risk else "",
+                    in_play=t.in_play, catalyst=t.catalyst, time_bucket=t.time_bucket, score=t.score)
+        total = 0.0
+        if t.stock_qty_initial:
+            n_half = t.stock_qty_initial - s_q
+            s_exit = (t.stock_half_exit * n_half + s_px * s_q) / t.stock_qty_initial if n_half else s_px
+            pnl = (s_exit - t.stock_fill) * sign * t.stock_qty_initial
+            total += pnl
+            self.risk.journal(dict(base, instrument="stock", contract=t.ticker, contracts=t.stock_qty_initial,
+                                   option_entry=t.stock_fill, option_exit=round(s_exit, 2),
+                                   option_r=round((s_exit - t.stock_fill) * sign / stock_risk, 2) if stock_risk else "",
+                                   pnl=round(pnl, 2)))
+        if t.contracts_initial:
+            n_half = t.contracts_initial - o_q
+            o_exit = (t.half_exit_price * n_half + o_px * o_q) / t.contracts_initial if n_half else o_px
+            pnl = (o_exit - t.option_entry) * 100 * t.contracts_initial
+            total += pnl
+            opt_risk = t.option_planned_risk if t.option_planned_risk > 0 else max(t.option_entry * 0.4, 0.01)
+            self.risk.journal(dict(base, instrument="option", contract=t.contract, contracts=t.contracts_initial,
+                                   option_entry=t.option_entry, option_exit=round(o_exit, 2),
+                                   option_r=round((o_exit - t.option_entry) / opt_risk, 2), pnl=round(pnl, 2)))
+        self.log(f"CLOSED {t.ticker} {reason}: stock R {base['stock_r']}  P&L {total:+.0f}  "
                  f"(day {self.risk.today_pnl(now.date()):+.0f}, week {self.risk.week_pnl(now.date()):+.0f})")
         self.open = None
         save_state(None)
-        self.events.append(f"{now:%H:%M:%S} CLOSED {t.ticker} {reason} pnl {pnl:+.0f}")
+        self.events.append(f"{now:%H:%M:%S} CLOSED {t.ticker} {reason} pnl {total:+.0f}")
         self.persist(); self.publish_status()
 
     def manage(self, now: datetime):
@@ -505,7 +580,7 @@ class PaperTrader:
         px = float(m1["Close"].iloc[-1])
         long = t.direction == "LONG"
         sign = 1 if long else -1
-        mark = self.option_mark(t.contract, t.option_entry)
+        mark = self.option_mark(t.contract, t.option_entry) if t.contracts else 0.0
         # completed 5-min bars only (the last row may be in progress)
         done5 = m5.iloc[:-1] if (now - m5.index[-1]).total_seconds() < 300 else m5
         last5 = done5.iloc[-1] if len(done5) else None
@@ -516,27 +591,27 @@ class PaperTrader:
 
         # 1. hard close
         if now.strftime("%H:%M") >= self.a.flat_by:
-            self.close_and_journal(t.contracts, "hard close 15:45 (Rule 3)", px, now, mark); return
-        # 2. option circuit breaker
-        if mark <= t.option_entry * (1 - self.a.breaker_pct / 100):
-            self.close_and_journal(t.contracts, f"option breaker: mark {mark:.2f} <= {100-self.a.breaker_pct:.0f}% of entry", px, now, mark); return
+            self.exit_trade(1.0, "hard close 15:45 (Rule 3)", px, now, mark); return
+        # 2. option circuit breaker (option leg only; the stock leg follows the book's levels)
+        if t.contracts and mark <= t.option_entry * (1 - self.a.breaker_pct / 100):
+            self.exit_trade(1.0, f"option breaker: mark {mark:.2f} <= {100-self.a.breaker_pct:.0f}% of entry", px, now, mark); return
         # 3. stop: 5-min close through the level (or break-even after the half)
         stop = t.stock_entry if t.breakeven else t.stock_stop
         if last5 is not None and (float(last5["Close"]) - stop) * sign < 0:
-            self.close_and_journal(t.contracts, f"stop: 5-min close {float(last5['Close']):.2f} through {stop:.2f}", px, now, mark); return
+            self.exit_trade(1.0, f"stop: 5-min close {float(last5['Close']):.2f} through {stop:.2f}", px, now, mark); return
         # 4. target touched
         if (px - t.stock_target) * sign >= 0 and not t.half_taken:
-            if t.contracts >= 2:
-                self.close_and_journal(t.contracts // 2, f"target {t.stock_target:.2f} touched: half off", px, now, mark); return
-            self.close_and_journal(t.contracts, f"target {t.stock_target:.2f} touched", px, now, mark); return
+            if t.stock_qty >= 2 or t.contracts >= 2:
+                self.exit_trade(0.5, f"target {t.stock_target:.2f} touched: half off", px, now, mark); return
+            self.exit_trade(1.0, f"target {t.stock_target:.2f} touched", px, now, mark); return
         # 5. runner exit: new 5-min low (long) / high (short) after the half
         if t.half_taken and last5 is not None and prev5 is not None:
             weak = (float(last5["Low"]) < float(prev5["Low"])) if long else (float(last5["High"]) > float(prev5["High"]))
             if weak:
-                self.close_and_journal(t.contracts, "runner: new 5-min low/high (book: buyers exhausted)", px, now, mark); return
+                self.exit_trade(1.0, "runner: new 5-min low/high (book: buyers exhausted)", px, now, mark); return
         # 6. time stop
         if mins >= self.a.time_stop_min and (px - t.stock_entry) * sign <= 0 and not t.half_taken:
-            self.close_and_journal(t.contracts, f"time stop: {mins:.0f} min, stock not in our favour", px, now, mark); return
+            self.exit_trade(1.0, f"time stop: {mins:.0f} min, stock not in our favour", px, now, mark); return
 
     # ---- main loop ------------------------------------------------------------------
     def run(self):
@@ -606,6 +681,9 @@ def main(argv=None):
     p.add_argument("--max-spread", type=float, default=10.0, help="max option spread %% of mid (10 for the paper test so the journal can measure the cost; use 5 live)")
     p.add_argument("--min-price", type=float, default=10.0, help="universe floor (book: $10-$100 is the range for all strategies; sub-$10 options are illiquid)")
     p.add_argument("--max-contracts", type=int, default=2)
+    p.add_argument("--instrument", choices=["stock", "option", "both"], default="both",
+                   help="stock = trade shares (what the book trades); option = only when a liquid contract clears 2:1; both = stock leg always, option leg when liquid")
+    p.add_argument("--max-notional-pct", type=float, default=100.0, help="cap on the stock leg's notional as %% of --account (100 = no margin)")
     p.add_argument("--strategies", default="VWAP,ORB,SupportResistance,RedToGreen",
                    help="comma list of allowed strategies (book's core ones by default; add MATrend,BottomReversal,TopReversal,ABCD,BullFlag later)")
     p.add_argument("--windows", default="09:45-11:00", help="entry windows ET, comma-separated, e.g. 09:45-11:00,15:00-15:30")
@@ -618,6 +696,7 @@ def main(argv=None):
     p.add_argument("--max-day-trades-5d", type=int, default=0,
                    help="legacy PDT-style cap (3 per 5 business days); 0 = off. PDT was eliminated 2026-06-04 but some brokers still enforce it until 2027-10")
     p.add_argument("--ignore-clock", action="store_true", help="testing only: run the loop outside market hours")
+    p.add_argument("--allow-midday", action="store_true", help="let setups fire 11:00-15:00 too (book: worst time of day; off by default)")
     p.add_argument("--wait-until", default=None, help="HH:MM ET: sleep until this time before starting (for a UTC cron that fires early)")
     p.add_argument("--publish-every", type=int, default=120, help="seconds between status-page publishes while idle")
     p.add_argument("--min-catalyst-grade", default="B", choices=list("ABCD"),
@@ -635,7 +714,7 @@ def main(argv=None):
     a.risk_pct = min(a.risk_pct, 2.0)
 
     cfg = Config(account_size=a.account, risk_pct=a.risk_pct, max_spread_pct=a.max_spread, min_price=a.min_price,
-                 universe_size=a.universe_size, include_mid_day=False)
+                 universe_size=a.universe_size, include_mid_day=a.allow_midday)
     log = lambda *x: print(f"[{datetime.now(NY):%H:%M:%S}]", *x, flush=True)
     try:
         PaperTrader(cfg, a, log).run()
