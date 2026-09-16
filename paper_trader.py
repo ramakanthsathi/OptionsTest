@@ -280,6 +280,7 @@ class PaperTrader:
         self.open: Optional[OpenTrade] = load_state()
         self.allowed = set(s.strip() for s in args.strategies.split(","))
         self.last_scan_info: dict = {"time": None, "candidates": [], "note": "not started"}
+        self.funnel: dict = {}
         self.events: list[str] = []
 
     # ---- persistence / status ----------------------------------------------------
@@ -373,7 +374,8 @@ class PaperTrader:
     # ---- entry ----------------------------------------------------------------
     def find_candidates(self, now: datetime) -> list[dict]:
         tickers = [t.upper() for t in self.a.tickers] if self.a.tickers else self.source.universe(self.cfg)
-        results, rejected, _ = scan_once(self.cfg, self.source, tickers, now, lambda *x: None, with_options=True)
+        results, rejected, ctxs = scan_once(self.cfg, self.source, tickers, now, lambda *x: None, with_options=True,
+                                            include_not_in_play=True)
         dirs: dict[str, set] = {}
         for r in results:
             dirs.setdefault(r["signal"].ticker, set()).add(r["signal"].direction)
@@ -398,6 +400,20 @@ class PaperTrader:
                 continue
             out.append(r)
         out.sort(key=lambda r: -r["score"])
+        # funnel: where did signals die this scan? (shown on the status page)
+        n_inplay = sum(1 for r in results if r["ctx"].in_play)
+        n_grade = sum(1 for r in results if r["ctx"].in_play and "ABCDF".index(r["ctx"].catalyst_grade) <= "ABCDF".index(self.a.min_catalyst_grade))
+        n_strat = sum(1 for r in results if r["ctx"].in_play and any(b in self.allowed for b in r["signal"].strategy.split("+")))
+        n_liquid = sum(1 for r in results if r["ctx"].in_play and r["option"] and not any(x.startswith("NO contract") for x in r["option"].notes))
+        n_act = sum(1 for r in results if r["ctx"].in_play and r["option"] and r["option"].actionable)
+        self.funnel = {"scanned": len(ctxs), "in_play_stocks": sum(1 for c in ctxs if c.in_play),
+                       "stock_setups_2to1": len(results), "on_in_play_stock": n_inplay, "grade_ok": n_grade,
+                       "strategy_ok": n_strat, "option_liquid": n_liquid, "option_actionable": n_act, "candidates": len(out),
+                       "grades": dict(sorted(__import__("collections").Counter(c.catalyst_grade for c in ctxs).items())),
+                       "stock_setups": [f"{r['signal'].ticker} {r['signal'].strategy} {r['signal'].direction} rr {r['signal'].rr:.1f} "
+                                        f"grade {r['ctx'].catalyst_grade}{'' if r['ctx'].in_play else ' (not in play)'}"
+                                        + (f" | opt: {r['option'].contract} spread {r['option'].spread_pct}% R:R {r['option'].option_rr}" if r['option'] else " | opt: none")
+                                        for r in results[:12]]}
         return out
 
     def enter(self, r: dict, now: datetime):
@@ -563,7 +579,8 @@ class PaperTrader:
                     else:
                         cands = self.find_candidates(now)
                         self.last_scan_info = {"time": now.strftime("%H:%M:%S"), "note": f"{len(cands)} candidate(s)",
-                                               "candidates": [alert_line(c["signal"], c["option"]) for c in cands[:5]]}
+                                               "candidates": [alert_line(c["signal"], c["option"]) for c in cands[:5]],
+                                               "funnel": self.funnel}
                         self.log(f"{now:%H:%M} scan: {len(cands)} candidate(s)" +
                                  (" -> " + "; ".join(alert_line(c['signal'], c['option']) for c in cands[:3]) if cands else ""))
                         if cands:
@@ -586,7 +603,8 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--account", type=float, default=10_000, help="account size used for SIZING (your live size), not the paper balance")
     p.add_argument("--risk-pct", type=float, default=1.0)
-    p.add_argument("--max-spread", type=float, default=5.0, help="max option spread %% of mid (5 = stricter than the scanner default)")
+    p.add_argument("--max-spread", type=float, default=10.0, help="max option spread %% of mid (10 for the paper test so the journal can measure the cost; use 5 live)")
+    p.add_argument("--min-price", type=float, default=10.0, help="universe floor (book: $10-$100 is the range for all strategies; sub-$10 options are illiquid)")
     p.add_argument("--max-contracts", type=int, default=2)
     p.add_argument("--strategies", default="VWAP,ORB,SupportResistance,RedToGreen",
                    help="comma list of allowed strategies (book's core ones by default; add MATrend,BottomReversal,TopReversal,ABCD,BullFlag later)")
@@ -616,7 +634,7 @@ def main(argv=None):
     a.windows = [tuple(w.split("-")) for w in a.windows.split(",")]
     a.risk_pct = min(a.risk_pct, 2.0)
 
-    cfg = Config(account_size=a.account, risk_pct=a.risk_pct, max_spread_pct=a.max_spread,
+    cfg = Config(account_size=a.account, risk_pct=a.risk_pct, max_spread_pct=a.max_spread, min_price=a.min_price,
                  universe_size=a.universe_size, include_mid_day=False)
     log = lambda *x: print(f"[{datetime.now(NY):%H:%M:%S}]", *x, flush=True)
     try:

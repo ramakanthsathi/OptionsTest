@@ -1232,12 +1232,15 @@ def to_jsonable(o):
 # ===========================================================================
 # MAIN
 # ===========================================================================
-def apply_peer_cluster_rule(contexts: list[StockContext], cfg: Config) -> None:
+def apply_peer_cluster_rule(contexts: list[StockContext], cfg: Config, mkt: dict) -> None:
     """Book, Ch. 4: "If I have a few stocks in one sector [on the scanner], there is a good chance
     that these stocks are not in play. They have high relative volume because their sector is under
-    heavy trading by institutional traders."  When >= peer_cluster_min names in the same sector are
-    moving >= min_gap_pct the same way today, each of them is a sector move (grade F, not in play)
-    unless it has an A-grade catalyst of its own (earnings / guidance / FDA / M&A)."""
+    heavy trading by institutional traders."
+    A cluster only counts as a sector move when the sector ETF *confirms* it: >= peer_cluster_min
+    same-sector names moving the same way AND the sector ETF moved >= 1.0% that way, or a herd of
+    >= 8 names with the ETF at least 0.5% that way (2026-09-14: 19 semis down, XLK down).
+    Without ETF confirmation, three Technology names among thirty gappers is just Tuesday.
+    A-grade catalysts (earnings / guidance / FDA / M&A) are exempt."""
     by_sector: dict[tuple[str, int], list[StockContext]] = {}
     for c in contexts:
         if not c.sector or not np.isfinite(c.prev_close) or c.prev_close <= 0:
@@ -1246,19 +1249,24 @@ def apply_peer_cluster_rule(contexts: list[StockContext], cfg: Config) -> None:
         if abs(chg) >= cfg.min_gap_pct:
             by_sector.setdefault((c.sector, 1 if chg > 0 else -1), []).append(c)
     for (sector, sign), members in by_sector.items():
-        if len(members) < cfg.peer_cluster_min:
+        etf = catmod.sector_etf(sector)
+        etf_move = mkt.get(etf) if etf else None
+        n = len(members)
+        confirmed = etf_move is not None and etf_move * sign > 0 and (
+            (n >= cfg.peer_cluster_min and abs(etf_move) >= 1.0) or (n >= 8 and abs(etf_move) >= 0.5))
+        if not confirmed:
             continue
         names = " ".join(m.ticker for m in members)
+        why = f"{n} {sector} names {'up' if sign > 0 else 'down'} together with {etf} {etf_move:+.1f}%"
         for c in members:
             if c.catalyst_grade == "A":
-                c.warnings.append(f"sector cluster ({len(members)} {sector} names {'up' if sign > 0 else 'down'} together: {names}) "
-                                  f"but A-grade catalyst of its own -> kept")
+                c.warnings.append(f"sector cluster ({why}: {names}) but A-grade catalyst of its own -> kept")
                 continue
             c.catalyst_grade = "F"
             c.catalyst_kind = "sector-cluster"
-            c.catalyst = f"F [sector-cluster] {len(members)} {sector} names {'up' if sign > 0 else 'down'} together today ({names}); " + c.catalyst
+            c.catalyst = f"F [sector-cluster] {why} ({names}); " + c.catalyst
             c.in_play = False
-            c.warnings.append(f"Rule 4 / Ch. 4: {len(members)} {sector} stocks gapping the same way -> sector move, not a Stock in Play")
+            c.warnings.append(f"Rule 4 / Ch. 4: {why} -> sector move, not a Stock in Play")
 
 
 def scan_once(cfg: Config, source, tickers: list[str], now: datetime, log, replay: Optional[str] = None,
@@ -1288,7 +1296,7 @@ def scan_once(cfg: Config, source, tickers: list[str], now: datetime, log, repla
         if source.name == "yahoo":
             time.sleep(0.2)  # be polite to Yahoo
 
-    apply_peer_cluster_rule(contexts, cfg)
+    apply_peer_cluster_rule(contexts, cfg, source.market_context())
 
     for i, t, (ctx, reg, levels, atr_val) in assessed_all:
         det = SetupDetector(t, reg, levels, atr_val, ctx.prev_close, cfg, rejected)
