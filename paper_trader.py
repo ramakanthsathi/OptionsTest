@@ -609,9 +609,12 @@ class PaperTrader:
             weak = (float(last5["Low"]) < float(prev5["Low"])) if long else (float(last5["High"]) > float(prev5["High"]))
             if weak:
                 self.exit_trade(1.0, "runner: new 5-min low/high (book: buyers exhausted)", px, now, mark); return
-        # 6. time stop
-        if mins >= self.a.time_stop_min and (px - t.stock_entry) * sign <= 0 and not t.half_taken:
-            self.exit_trade(1.0, f"time stop: {mins:.0f} min, stock not in our favour", px, now, mark); return
+        # 6. time stop: book -- "if I hold for a few minutes and the price stays flat, I get out".
+        #    Flat = less than halfway to the target after the time limit (a few cents green is still flat).
+        if mins >= self.a.time_stop_min and not t.half_taken:
+            progress = (px - t.stock_entry) / (t.stock_target - t.stock_entry) if t.stock_target != t.stock_entry else 0.0
+            if progress < self.a.time_stop_progress:
+                self.exit_trade(1.0, f"time stop: {mins:.0f} min, only {progress:+.0%} of the way to target", px, now, mark); return
 
     # ---- main loop ------------------------------------------------------------------
     def run(self):
@@ -689,6 +692,7 @@ def main(argv=None):
     p.add_argument("--windows", default="09:45-11:00", help="entry windows ET, comma-separated, e.g. 09:45-11:00,15:00-15:30")
     p.add_argument("--flat-by", default="15:45")
     p.add_argument("--time-stop-min", type=int, default=20)
+    p.add_argument("--time-stop-progress", type=float, default=0.5, help="after --time-stop-min, exit unless this fraction of the way to target")
     p.add_argument("--breaker-pct", type=float, default=40.0, help="sell if the option marks this %% below entry")
     p.add_argument("--daily-loss-pct", type=float, default=2.0)
     p.add_argument("--weekly-loss-pct", type=float, default=5.0)
