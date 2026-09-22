@@ -207,6 +207,8 @@ class OpenTrade:
     stock_qty_initial: int = 0
     stock_fill: float = 0.0   # stock leg fill price
     stock_half_exit: float = 0.0
+    profit_zone: bool = False      # reached >= --time-stop-r: time stop cancelled, stop trails (book, Reversal section)
+    trail_stop: float = 0.0        # trailing stop level once in the profit zone (0 = not set)
 
 
 class RiskBook:
@@ -395,7 +397,19 @@ class PaperTrader:
 
     # ---- entry ----------------------------------------------------------------
     def find_candidates(self, now: datetime) -> list[dict]:
-        tickers = [t.upper() for t in self.a.tickers] if self.a.tickers else self.source.universe(self.cfg)
+        if self.a.tickers:
+            tickers = [t.upper() for t in self.a.tickers]
+        else:
+            tickers = self.source.universe(self.cfg)
+            if tickers:
+                self._last_universe = tickers
+            elif getattr(self, "_last_universe", None):
+                tickers = self._last_universe            # screener hiccup (seen 2026-09-22): reuse the last good list
+                self.note(f"   screener returned nothing; reusing the previous universe ({len(tickers)} names)")
+            else:
+                self.note("   screener returned nothing and no previous universe -> skipping this scan")
+                self.funnel = {"scanned": 0, "note": "screener unavailable"}
+                return []
         results, rejected, ctxs = scan_once(self.cfg, self.source, tickers, now, lambda *x: None, with_options=True,
                                             include_not_in_play=True)
         dirs: dict[str, set] = {}
@@ -595,8 +609,24 @@ class PaperTrader:
         # 2. option circuit breaker (option leg only; the stock leg follows the book's levels)
         if t.contracts and mark <= t.option_entry * (1 - self.a.breaker_pct / 100):
             self.exit_trade(1.0, f"option breaker: mark {mark:.2f} <= {100-self.a.breaker_pct:.0f}% of entry", px, now, mark); return
-        # 3. stop: 5-min close through the level (or break-even after the half)
-        stop = t.stock_entry if t.breakeven else t.stock_stop
+        # ---- profit zone (book, Reversal section): "If I get into the profit zone, I can start
+        # adjusting my stop, first to break-even, and then to the low of the last 5-minute candle.
+        # I will then keep adjusting my stop as I move up."  Reaching it also cancels the time stop,
+        # which the book reserves for a position that "stays flat".
+        risk = abs(t.stock_entry - t.stock_stop)
+        r_now = ((px - t.stock_entry) * sign / risk) if risk else 0.0
+        if not t.profit_zone and r_now >= self.a.time_stop_r:
+            t.profit_zone = t.breakeven = True
+            self.note(f"   {t.ticker} in the profit zone ({r_now:+.2f}R): stop -> break-even, now trailing")
+        if t.profit_zone and last5 is not None:
+            level = float(last5["Low"]) if long else float(last5["High"])
+            cand = max(level, t.stock_entry) if long else min(level, t.stock_entry)
+            if t.trail_stop == 0.0 or (cand - t.trail_stop) * sign > 0:   # only ever tighten
+                t.trail_stop = cand
+                save_state(t)
+
+        # 3. stop: 5-min close through the level (break-even / trailed once in the profit zone)
+        stop = (t.trail_stop or t.stock_entry) if t.breakeven else t.stock_stop
         if last5 is not None and (float(last5["Close"]) - stop) * sign < 0:
             self.exit_trade(1.0, f"stop: 5-min close {float(last5['Close']):.2f} through {stop:.2f}", px, now, mark); return
         # 4. target touched
@@ -610,11 +640,11 @@ class PaperTrader:
             if weak:
                 self.exit_trade(1.0, "runner: new 5-min low/high (book: buyers exhausted)", px, now, mark); return
         # 6. time stop: book -- "if I hold for a few minutes and the price stays flat, I get out".
-        #    Flat = less than halfway to the target after the time limit (a few cents green is still flat).
-        if mins >= self.a.time_stop_min and not t.half_taken:
-            progress = (px - t.stock_entry) / (t.stock_target - t.stock_entry) if t.stock_target != t.stock_entry else 0.0
-            if progress < self.a.time_stop_progress:
-                self.exit_trade(1.0, f"time stop: {mins:.0f} min, only {progress:+.0%} of the way to target", px, now, mark); return
+        #    Flat is measured in R, not as a fraction of the target: on a 3:1 plan, "half way to
+        #    target" would be 1.5R, which cuts genuine winners (HOOD 2026-09-18 exited at +1.03R).
+        #    Once the trade has made --time-stop-r it is not flat: it trails instead (profit zone).
+        if mins >= self.a.time_stop_min and not t.half_taken and not t.profit_zone:
+            self.exit_trade(1.0, f"time stop: {mins:.0f} min, only {r_now:+.2f}R (flat)", px, now, mark); return
 
     # ---- main loop ------------------------------------------------------------------
     def run(self):
@@ -692,7 +722,9 @@ def main(argv=None):
     p.add_argument("--windows", default="09:45-11:00", help="entry windows ET, comma-separated, e.g. 09:45-11:00,15:00-15:30")
     p.add_argument("--flat-by", default="15:45")
     p.add_argument("--time-stop-min", type=int, default=20)
-    p.add_argument("--time-stop-progress", type=float, default=0.5, help="after --time-stop-min, exit unless this fraction of the way to target")
+    p.add_argument("--time-stop-r", type=float, default=0.5,
+                   help="R gained that counts as 'not flat': below it the time stop fires, at or above it the trade enters "
+                        "the profit zone (stop to break-even, then trailing the last 5-min candle)")
     p.add_argument("--breaker-pct", type=float, default=40.0, help="sell if the option marks this %% below entry")
     p.add_argument("--daily-loss-pct", type=float, default=2.0)
     p.add_argument("--weekly-loss-pct", type=float, default=5.0)
