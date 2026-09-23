@@ -71,10 +71,18 @@ ACR_SERVER=$(az acr show -n "$ACR" --query loginServer -o tsv)
 ACR_USER=$(az acr credential show -n "$ACR" --query username -o tsv)
 ACR_PASS=$(az acr credential show -n "$ACR" --query "passwords[0].value" -o tsv)
 
+echo "== log analytics workspace (console logs; without it a failed run leaves nothing to read)"
+WS="${WS:-log-aziz-trader}"
+WS_URL="https://management.azure.com/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$RG/providers/Microsoft.OperationalInsights/workspaces/$WS"
+az rest --method put --url "$WS_URL?api-version=2023-09-01"    --body "{\"location\":\"$CAE_LOCATION\",\"properties\":{\"sku\":{\"name\":\"PerGB2018\"},\"retentionInDays\":30}}" -o none
+until [[ "$(az rest --method get --url "$WS_URL?api-version=2023-09-01" --query properties.provisioningState -o tsv)" == "Succeeded" ]]; do sleep 10; done
+WS_ID=$(az rest --method get --url "$WS_URL?api-version=2023-09-01" --query properties.customerId -o tsv)
+WS_KEY=$(az rest --method post --url "$WS_URL/sharedKeys?api-version=2020-08-01" --query primarySharedKey -o tsv)
+
 echo "== container apps environment + job (ARM template; no CLI extension needed)"
 az provider register -n Microsoft.App --wait -o none
 az provider register -n Microsoft.OperationalInsights --wait -o none
-az deployment group create -g "$RG" -n "paper-trader-$(date +%Y%m%d%H%M%S)"    --template-file "$(dirname "$0")/job.json"    --parameters location="$CAE_LOCATION" envName="$ENV_NAME" jobName="$JOB" image="$ACR_SERVER/paper-trader:latest"                 registryServer="$ACR_SERVER" registryUsername="$ACR_USER" registryPassword="$ACR_PASS"                 cron="$CRON" traderArgs="${TRADER_ARGS:-}"                 uwKey="$UW_API_KEY" apcaKey="$APCA_API_KEY_ID" apcaSecret="$APCA_API_SECRET_KEY"                 sasUrl="$SAS_URL" pagePass="$JOURNAL_PAGE_PASSPHRASE"    --query "properties.provisioningState" -o tsv
+az deployment group create -g "$RG" -n "paper-trader-$(date +%Y%m%d%H%M%S)"    --template-file "$(dirname "$0")/job.json"    --parameters location="$CAE_LOCATION" envName="$ENV_NAME" jobName="$JOB" image="$ACR_SERVER/paper-trader:latest"                 registryServer="$ACR_SERVER" registryUsername="$ACR_USER" registryPassword="$ACR_PASS"                 cron="$CRON" traderArgs="${TRADER_ARGS:-}"                 uwKey="$UW_API_KEY" apcaKey="$APCA_API_KEY_ID" apcaSecret="$APCA_API_SECRET_KEY"                 sasUrl="$SAS_URL" pagePass="$JOURNAL_PAGE_PASSPHRASE"                 logWorkspaceId="$WS_ID" logWorkspaceKey="$WS_KEY"    --query "properties.provisioningState" -o tsv
 
 printf 'JOURNAL_BLOB_SAS_URL=%s
 DATA_URL=%s
@@ -85,7 +93,8 @@ DONE.
   Job:        $JOB in $RG  (cron '$CRON' UTC, one execution per weekday, exits after 15:45 ET)
   Run now:    bash deploy/job.sh start
   Executions: bash deploy/job.sh list
-  Logs:       Azure portal -> Container Apps Jobs -> $JOB -> Execution history -> Console logs
+  Logs:       bash deploy/job.sh logs [minutes]   (Log Analytics workspace $WS)
+              or Azure portal -> Container Apps Jobs -> $JOB -> Execution history -> Console logs
               (the 'az containerapp' extension cannot install on this machine's CLI; job.sh uses the REST API)
   Journal:    write-access SAS URL saved to deploy/secrets.local.env (git-ignored) -- keep it out of the site
   Page data:  $DATA_URL
