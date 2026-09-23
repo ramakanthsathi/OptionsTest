@@ -14,6 +14,10 @@ import paper_trader as pt
 
 NY = ZoneInfo("America/New_York")
 
+# manage() persists through save_state(); tests must never touch the real paper_state.json
+# (on 2026-09-22 a synthetic TEST trade leaked into it and a later run "resumed" it).
+pt.save_state = lambda t: None
+
 
 def bars(closes, start="10:00", date="2026-09-22", spread=0.05):
     """closes -> 5-min OHLC frame (low/high padded by `spread`)."""

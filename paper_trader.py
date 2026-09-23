@@ -45,6 +45,7 @@ import os
 import ssl
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -101,18 +102,35 @@ class AlpacaPaper:
         cafile = os.environ.get("SSL_CERT_FILE")
         self._ctx = ssl.create_default_context(cafile=cafile if cafile and os.path.exists(cafile) else None)
 
-    def _req(self, method: str, path: str, body: Optional[dict] = None, params: Optional[dict] = None):
+    def _req(self, method: str, path: str, body: Optional[dict] = None, params: Optional[dict] = None,
+             attempts: int = 3):
+        """Every failure leaves here as RuntimeError, which the run loop knows how to survive.
+        A raw URLError used to escape and kill the whole trading day (2026-09-23 execution)."""
         url = self.BASE + path + ("?" + urllib.parse.urlencode(params) if params else "")
         data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(url, data=data, method=method, headers={
-            "APCA-API-KEY-ID": self.key, "APCA-API-SECRET-KEY": self.secret,
-            "Content-Type": "application/json", "Accept": "application/json"})
-        try:
-            with urllib.request.urlopen(req, context=self._ctx, timeout=30) as r:
-                raw = r.read().decode("utf-8")
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(f"Alpaca {e.code} {method} {path}: {e.read().decode('utf-8', 'replace')[:300]}") from None
+        last = ""
+        for attempt in range(attempts):
+            req = urllib.request.Request(url, data=data, method=method, headers={
+                "APCA-API-KEY-ID": self.key, "APCA-API-SECRET-KEY": self.secret,
+                "Content-Type": "application/json", "Accept": "application/json"})
+            try:
+                with urllib.request.urlopen(req, context=self._ctx, timeout=30) as r:
+                    raw = r.read().decode("utf-8")
+                    return json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as e:
+                body_txt = e.read().decode("utf-8", "replace")[:300]
+                if e.code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+                    last = f"{e.code} {body_txt}"
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"Alpaca {e.code} {method} {path}: {body_txt}") from None
+            except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as e:
+                last = repr(e)
+                if attempt < attempts - 1:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"Alpaca {method} {path} unreachable after {attempts} tries: {last}") from None
+        raise RuntimeError(f"Alpaca {method} {path} failed: {last}")
 
     def account(self) -> dict:
         return self._req("GET", "/account")
@@ -294,6 +312,7 @@ class PaperTrader:
         self.allowed = set(s.strip() for s in args.strategies.split(","))
         self.last_scan_info: dict = {"time": None, "candidates": [], "note": "not started"}
         self.funnel: dict = {}
+        self.consec_errors = 0
         self.events: list[str] = []
 
     # ---- persistence / status ----------------------------------------------------
@@ -697,7 +716,19 @@ class PaperTrader:
                     last_scan = time.time()
                     self.log(f"{now:%H:%M} outside entry window; waiting")
             except (DataError, RuntimeError) as e:
-                self.log(f"   error: {e}")
+                self.consec_errors += 1
+                self.note(f"   error ({self.consec_errors} in a row): {e}")
+            except Exception as e:                       # noqa: BLE001 -- staying alive beats a clean stack trace
+                self.consec_errors += 1
+                tb = traceback.format_exc(limit=3).replace("\n", " | ")[-400:]
+                self.note(f"   UNEXPECTED {type(e).__name__} ({self.consec_errors} in a row): {e} :: {tb}")
+                if self.open:
+                    self.note(f"   NOTE: {self.open.ticker} is still open and must keep being managed")
+            else:
+                self.consec_errors = 0
+            if self.consec_errors and self.consec_errors % 10 == 0:
+                self.note(f"   {self.consec_errors} consecutive errors -- still trying")
+                self.publish_status()
             if self.a.once and not self.open:
                 self.publish_status(); break
             time.sleep(self.a.poll_every if self.open else 5)
